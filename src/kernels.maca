@@ -1,7 +1,23 @@
 #include <vector>
 #include <common/maca_fp16.h>
+#include <algorithm>
+#include <cmath>
+#include <type_traits>
 
 #include "../tester/utils.h"
+
+#if defined(PLATFORM_METAX)
+#include <mcr/mc_runtime.h>
+#include <mcr/mc_runtime_api.h>
+
+// 前向声明
+template <typename T>
+void flashAttention_gpu(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                       const std::vector<T>& h_v, std::vector<T>& h_o,
+                       int batch_size, int target_seq_len, int src_seq_len,
+                       int query_heads, int kv_heads, int head_dim, bool is_causal);
+
+#endif
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,9 +35,88 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  T result = T(0);
+  size_t min_dim = std::min(rows, cols);
+  for (size_t i = 0; i < min_dim; ++i) {
+    result += h_input[i * cols + i];
+  }
+  return result;
 }
+
+#if defined(PLATFORM_METAX)
+/**
+ * @brief CUDA kernel for computing matrix trace
+ * 
+ * @tparam T Data type of matrix elements
+ * @param d_input Device pointer to flattened matrix
+ * @param rows Number of rows in matrix
+ * @param cols Number of columns in matrix
+ * @param d_result Device pointer to store trace result
+ */
+template <typename T>
+__global__ void trace_kernel(const T* d_input, size_t rows, size_t cols, T* d_result) {
+  __shared__ T s_sum[1];
+  
+  if (threadIdx.x == 0) {
+    s_sum[0] = T(0);
+  }
+  __syncthreads();
+  
+  size_t min_dim = min(rows, cols);
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < min_dim; i += gridDim.x * blockDim.x) {
+    atomicAdd(&s_sum[0], d_input[i * cols + i]);
+  }
+  __syncthreads();
+  
+  if (threadIdx.x == 0) {
+    atomicAdd(d_result, s_sum[0]);
+  }
+}
+
+/**
+ * @brief Computes the trace of a matrix using MetaX GPU
+ * 
+ * @tparam T Data type of matrix elements
+ * @param h_input Host vector containing flattened matrix
+ * @param rows Number of rows in matrix
+ * @param cols Number of columns in matrix
+ * @return The trace of the matrix
+ */
+template <typename T>
+T trace_gpu(const std::vector<T>& h_input, size_t rows, size_t cols) {
+  T* d_input = nullptr;
+  T* d_result = nullptr;
+  T h_result = T(0);
+  
+  size_t input_size = rows * cols * sizeof(T);
+  size_t result_size = sizeof(T);
+  
+  // Allocate device memory
+  RUNTIME_CHECK(mcMalloc((void**)&d_input, input_size));
+  RUNTIME_CHECK(mcMalloc((void**)&d_result, result_size));
+  
+  // Initialize result to 0
+  RUNTIME_CHECK(mcMemset(d_result, 0, result_size));
+  
+  // Copy input from host to device
+  RUNTIME_CHECK(mcMemcpy(d_input, h_input.data(), input_size, mcMemcpyHostToDevice));
+  
+  // Launch kernel
+  dim3 blockDim(256);
+  dim3 gridDim(1);
+  trace_kernel<T><<<gridDim, blockDim>>>(d_input, rows, cols, d_result);
+  RUNTIME_CHECK(mcGetLastError());
+  
+  // Copy result from device to host
+  RUNTIME_CHECK(mcMemcpy(&h_result, d_result, result_size, mcMemcpyDeviceToHost));
+  
+  // Free device memory
+  RUNTIME_CHECK(mcFree(d_input));
+  RUNTIME_CHECK(mcFree(d_result));
+  
+  return h_result;
+}
+#endif
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
@@ -43,7 +138,66 @@ template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+#if defined(PLATFORM_METAX)
+    // Host端实现，使用GPU加速
+    flashAttention_gpu(h_q, h_k, h_v, h_o, batch_size, target_seq_len, src_seq_len, 
+                      query_heads, kv_heads, head_dim, is_causal);
+#else
+    // CPU端实现
+    size_t batch_stride = target_seq_len * query_heads * head_dim;
+    size_t tgt_seq_stride = query_heads * head_dim;
+    size_t src_seq_stride = kv_heads * head_dim;
+    size_t head_stride = head_dim;
+    
+    for (int b = 0; b < batch_size; ++b) {
+        for (int t = 0; t < target_seq_len; ++t) {
+            for (int qh = 0; qh < query_heads; ++qh) {
+                // 初始化输出为0
+                for (int d = 0; d < head_dim; ++d) {
+                    size_t o_idx = b * batch_stride + t * tgt_seq_stride + qh * head_stride + d;
+                    h_o[o_idx] = T(0);
+                }
+                
+                // 计算注意力权重和输出
+                T sum_weights = T(0);
+                for (int s = 0; s < src_seq_len; ++s) {
+                    // 应用因果掩码
+                    if (is_causal && s > t) {
+                        continue;
+                    }
+                    
+                    // 计算注意力分数（点积）
+                    T score = T(0);
+                    for (int d = 0; d < head_dim; ++d) {
+                        size_t q_idx = b * batch_stride + t * tgt_seq_stride + qh * head_stride + d;
+                        size_t k_idx = b * batch_stride + s * src_seq_stride + (qh % kv_heads) * head_stride + d;
+                        score += h_q[q_idx] * h_k[k_idx];
+                    }
+                    
+                    // 计算注意力权重（softmax）
+                    T weight = exp(score);
+                    sum_weights += weight;
+                    
+                    // 计算加权值并累加到输出
+                    for (int d = 0; d < head_dim; ++d) {
+                        size_t o_idx = b * batch_stride + t * tgt_seq_stride + qh * head_stride + d;
+                        size_t v_idx = b * batch_stride + s * src_seq_stride + (qh % kv_heads) * head_stride + d;
+                        h_o[o_idx] += weight * h_v[v_idx];
+                    }
+                }
+                
+                // 归一化输出
+                if (sum_weights > T(0)) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        size_t o_idx = b * batch_stride + t * tgt_seq_stride + qh * head_stride + d;
+                        h_o[o_idx] /= sum_weights;
+                    }
+                }
+            }
+        }
+    }
+#endif
 }
 
 // *********************************************************************
@@ -58,3 +212,241 @@ template void flashAttention<float>(const std::vector<float>&, const std::vector
 template void flashAttention<half>(const std::vector<half>&, const std::vector<half>&,
   const std::vector<half>&, std::vector<half>&,
   int, int, int, int, int, int, bool);
+
+#if defined(PLATFORM_METAX)
+template int trace_gpu<int>(const std::vector<int>&, size_t, size_t);
+template float trace_gpu<float>(const std::vector<float>&, size_t, size_t);
+template half trace_gpu<half>(const std::vector<half>&, size_t, size_t);
+
+/**
+ * @brief CUDA kernel for computing flash attention
+ * 
+ * @tparam T Data type of input/output tensors
+ * @param d_q Device pointer to query tensor
+ * @param d_k Device pointer to key tensor
+ * @param d_v Device pointer to value tensor
+ * @param d_o Device pointer to output tensor
+ * @param batch_size Batch dimension size
+ * @param target_seq_len Target sequence length
+ * @param src_seq_len Source sequence length
+ * @param query_heads Number of query attention heads
+ * @param kv_heads Number of key/value heads
+ * @param head_dim Dimension size of each attention head
+ * @param is_causal Whether to apply causal masking
+ */
+template <typename T>
+__global__ void flashAttention_kernel(const T* d_q, const T* d_k, const T* d_v, T* d_o,
+                                     int batch_size, int target_seq_len, int src_seq_len,
+                                     int query_heads, int kv_heads, int head_dim, bool is_causal) {
+    // 计算当前线程处理的batch和目标序列位置
+    int b = blockIdx.z;
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int qh = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // 检查边界
+    if (b >= batch_size || t >= target_seq_len || qh >= query_heads) {
+        return;
+    }
+    
+    // 计算各张量的索引偏移
+    size_t q_batch_stride = (size_t)target_seq_len * query_heads * head_dim;
+    size_t k_batch_stride = (size_t)src_seq_len * kv_heads * head_dim;
+    size_t v_batch_stride = k_batch_stride;
+    size_t o_batch_stride = q_batch_stride;
+    
+    size_t q_tgt_seq_stride = (size_t)query_heads * head_dim;
+    size_t k_src_seq_stride = (size_t)kv_heads * head_dim;
+    size_t v_src_seq_stride = k_src_seq_stride;
+    size_t o_tgt_seq_stride = q_tgt_seq_stride;
+    
+    size_t q_head_stride = head_dim;
+    size_t k_head_stride = head_dim;
+    size_t v_head_stride = head_dim;
+    size_t o_head_stride = head_dim;
+    
+    // 计算当前query的起始地址
+    size_t q_start = (size_t)b * q_batch_stride + (size_t)t * q_tgt_seq_stride + (size_t)qh * q_head_stride;
+    
+    // 计算当前输出的起始地址
+    size_t o_start = (size_t)b * o_batch_stride + (size_t)t * o_tgt_seq_stride + (size_t)qh * o_head_stride;
+    
+    // 初始化输出为0
+    for (int d = 0; d < head_dim; ++d) {
+        d_o[o_start + d] = T(0);
+    }
+    
+    // 计算注意力权重和输出
+    T sum_weights = T(0);
+    int kv_head = qh % kv_heads;
+    
+    // 计算缩放因子（1/sqrt(head_dim)）
+    float scale = 1.0f / sqrtf((float)head_dim);
+    
+    // 首先计算所有注意力分数，找到最大值以提高数值稳定性
+    T max_score = T(-1e9);
+    for (int s = 0; s < src_seq_len; ++s) {
+        // 应用因果掩码
+        if (is_causal && s > t) {
+            continue;
+        }
+        
+        // 计算当前key的起始地址
+        size_t k_start = (size_t)b * k_batch_stride + (size_t)s * k_src_seq_stride + (size_t)kv_head * k_head_stride;
+        
+        // 计算注意力分数（点积）
+        T score = T(0);
+        for (int d = 0; d < head_dim; ++d) {
+            score += d_q[q_start + d] * d_k[k_start + d];
+        }
+        
+        // 应用缩放因子
+        if (std::is_same<T, float>::value) {
+            score = (float)score * scale;
+        } else if (std::is_same<T, half>::value) {
+            score = __float2half(__half2float(score) * scale);
+        } else {
+            // 对于其他类型，使用显式类型转换避免歧义
+            score = static_cast<T>(static_cast<float>(score) * scale);
+        }
+        
+        // 更新最大值
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+    
+    // 计算注意力权重和输出
+    for (int s = 0; s < src_seq_len; ++s) {
+        // 应用因果掩码
+        if (is_causal && s > t) {
+            continue;
+        }
+        
+        // 计算当前key的起始地址
+        size_t k_start = (size_t)b * k_batch_stride + (size_t)s * k_src_seq_stride + (size_t)kv_head * k_head_stride;
+        
+        // 计算当前value的起始地址
+        size_t v_start = (size_t)b * v_batch_stride + (size_t)s * v_src_seq_stride + (size_t)kv_head * v_head_stride;
+        
+        // 计算注意力分数（点积）
+        T score = T(0);
+        for (int d = 0; d < head_dim; ++d) {
+            score += d_q[q_start + d] * d_k[k_start + d];
+        }
+        
+        // 应用缩放因子
+        if (std::is_same<T, float>::value) {
+            score = (float)score * scale;
+        } else if (std::is_same<T, half>::value) {
+            score = __float2half(__half2float(score) * scale);
+        } else {
+            // 对于其他类型，使用显式类型转换避免歧义
+            score = static_cast<T>(static_cast<float>(score) * scale);
+        }
+        
+        // 计算注意力权重（softmax），减去最大值以提高数值稳定性
+        T weight = T(0);
+        if (std::is_same<T, float>::value) {
+            weight = expf((float)(score - max_score));
+        } else if (std::is_same<T, half>::value) {
+            weight = __float2half(expf(__half2float(score - max_score)));
+        } else {
+            weight = exp(score - max_score);
+        }
+        sum_weights += weight;
+        
+        // 计算加权值并累加到输出
+        for (int d = 0; d < head_dim; ++d) {
+            d_o[o_start + d] += weight * d_v[v_start + d];
+        }
+    }
+    
+    // 归一化输出
+    if (sum_weights > T(0)) {
+        for (int d = 0; d < head_dim; ++d) {
+            d_o[o_start + d] /= sum_weights;
+        }
+    }
+}
+
+/**
+ * @brief Computes flash attention using MetaX GPU
+ * 
+ * @tparam T Data type of input/output tensors
+ * @param h_q Host vector containing query tensor
+ * @param h_k Host vector containing key tensor
+ * @param h_v Host vector containing value tensor
+ * @param h_o Host vector to store output tensor
+ * @param batch_size Batch dimension size
+ * @param target_seq_len Target sequence length
+ * @param src_seq_len Source sequence length
+ * @param query_heads Number of query attention heads
+ * @param kv_heads Number of key/value heads
+ * @param head_dim Dimension size of each attention head
+ * @param is_causal Whether to apply causal masking
+ */
+template <typename T>
+void flashAttention_gpu(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                       const std::vector<T>& h_v, std::vector<T>& h_o,
+                       int batch_size, int target_seq_len, int src_seq_len,
+                       int query_heads, int kv_heads, int head_dim, bool is_causal) {
+    T* d_q = nullptr;
+    T* d_k = nullptr;
+    T* d_v = nullptr;
+    T* d_o = nullptr;
+    
+    // 计算各张量的大小
+    size_t q_batch_stride = (size_t)target_seq_len * query_heads * head_dim;
+    size_t k_batch_stride = (size_t)src_seq_len * kv_heads * head_dim;
+    size_t v_batch_stride = k_batch_stride;
+    size_t o_batch_stride = q_batch_stride;
+    
+    size_t q_total_size = (size_t)batch_size * q_batch_stride;
+    size_t k_total_size = (size_t)batch_size * k_batch_stride;
+    size_t v_total_size = (size_t)batch_size * v_batch_stride;
+    size_t o_total_size = (size_t)batch_size * o_batch_stride;
+    
+    size_t element_size = sizeof(T);
+    
+    // 分配设备内存
+    RUNTIME_CHECK(mcMalloc((void**)&d_q, q_total_size * element_size));
+    RUNTIME_CHECK(mcMalloc((void**)&d_k, k_total_size * element_size));
+    RUNTIME_CHECK(mcMalloc((void**)&d_v, v_total_size * element_size));
+    RUNTIME_CHECK(mcMalloc((void**)&d_o, o_total_size * element_size));
+    
+    // 拷贝输入数据到设备
+    RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), q_total_size * element_size, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), k_total_size * element_size, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), v_total_size * element_size, mcMemcpyHostToDevice));
+    
+    // 配置kernel参数
+    dim3 blockDim(8, 8);  // 8x8线程块
+    dim3 gridDim((query_heads + blockDim.x - 1) / blockDim.x,
+                 (target_seq_len + blockDim.y - 1) / blockDim.y,
+                 batch_size);
+    
+    // 启动kernel
+    flashAttention_kernel<T><<<gridDim, blockDim>>>(d_q, d_k, d_v, d_o,
+                                                  batch_size, target_seq_len, src_seq_len,
+                                                  query_heads, kv_heads, head_dim, is_causal);
+    RUNTIME_CHECK(mcGetLastError());
+    
+    // 拷贝输出数据到主机
+    RUNTIME_CHECK(mcMemcpy(h_o.data(), d_o, o_total_size * element_size, mcMemcpyDeviceToHost));
+    
+    // 释放设备内存
+    RUNTIME_CHECK(mcFree(d_q));
+    RUNTIME_CHECK(mcFree(d_k));
+    RUNTIME_CHECK(mcFree(d_v));
+    RUNTIME_CHECK(mcFree(d_o));
+}
+
+// 显式模板实例化
+template void flashAttention_gpu<float>(const std::vector<float>&, const std::vector<float>&,
+                                       const std::vector<float>&, std::vector<float>&,
+                                       int, int, int, int, int, int, bool);
+template void flashAttention_gpu<half>(const std::vector<half>&, const std::vector<half>&,
+                                       const std::vector<half>&, std::vector<half>&,
+                                       int, int, int, int, int, int, bool);
+
+#endif
