@@ -10,65 +10,81 @@ import struct
 import numpy as np
 import torch
 import math
-
-import bitsandbytes as bnb
-from bitsandbytes.functional import quantize_nf4, dequantize_nf4, dequantize_blockwise
+import tempfile
+import shutil
+import time
 from torch.utils.cpp_extension import load
+
+quantize_nf4 = None
+dequantize_nf4 = None
+def _ensure_bitsandbytes():
+    """Lazy import bitsandbytes only when needed"""
+    global quantize_nf4, dequantize_nf4
+    if quantize_nf4 is None:
+        from bitsandbytes.functional import quantize_nf4 as qnf4, dequantize_nf4 as dnf4
+        quantize_nf4 = qnf4
+        dequantize_nf4 = dnf4
 
 _cuda_modules = {}
 def get_cuda_module(platform="nvidia"):
-    """Lazy load and cache the CUDA module from external files
-    
-    Args:
-        platform: Target platform, e.g., "nvidia", "metax"
-    """
     global _cuda_modules
     
     if platform not in _cuda_modules:
+        print(f"[DEBUG] CUDA module for platform={platform} not cached, loading...")
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Platform-specific source directory
         src_dir = os.path.join(script_dir, "src", platform)
-        if not os.path.exists(src_dir):
-            raise ValueError(f"Unsupported platform: {platform}, source directory not found: {src_dir}")
-        
-        # Collect source files
-        sources = []
-        for fname in os.listdir(src_dir):
-            if fname.endswith('.cpp') or fname.endswith('.cu'):
-                sources.append(os.path.join(src_dir, fname))
-        
-        if not sources:
-            raise ValueError(f"No source files found in {src_dir}")
-        
-        # Platform-specific compile flags
-        extra_cflags = ["-O3"]
-        extra_cuda_cflags = ["-O3"]
-        
-        if platform == "nvidia":
-            # Let nvcc auto-detect GPU architecture or compile for common architectures
-            extra_cuda_cflags.extend([
-                "-gencode=arch=compute_70,code=sm_70",
-                "-gencode=arch=compute_80,code=sm_80",
-                "-gencode=arch=compute_90,code=sm_90"
-            ])
+        print(f"[DEBUG] Source directory: {src_dir}")
+
+        if platform == "nvidia" or platform == "iluvatar":
+            sources = [os.path.join(src_dir, 'kernel.cu')]
+            extra_cuda_cflags = ["-O3"]
+            if platform == "nvidia":
+                os.environ['TORCH_CUDA_ARCH_LIST'] = "8.0"
+                # os.environ["MAX_JOBS"] = "1"
+                extra_cuda_cflags.extend([
+                    "-gencode=arch=compute_80,code=sm_80",
+                    # "-gencode=arch=compute_90,code=sm_90"
+                ])
+            module_name = f"nf4_dequant_{platform}"
+            # Use unique module name with timestamp to avoid lock file issues
+            # module_name = f"nf4_dequant_{platform}_{int(time.time())}"
+            print(f"[DEBUG] Loading JIT CUDA module: {module_name}")
+            print(f"[DEBUG] Sources: {sources}")
+            print(f"[DEBUG] extra_cuda_cflags: {extra_cuda_cflags}")
+            _cuda_modules[platform] = load(
+                name=module_name,
+                sources=sources,
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=extra_cuda_cflags,
+                verbose=True
+            )
+            print(f"[DEBUG] CUDA module loaded successfully!")
         elif platform == "metax":
-            # Metax-specific flags (to be added when needed)
-            pass
-        
-        module_name = f"nf4_dequant_{platform}"
-        _cuda_modules[platform] = load(
-            name=module_name,
-            sources=sources,
-            extra_cflags=extra_cflags,
-            extra_cuda_cflags=extra_cuda_cflags,
-            verbose=False
-        )
+            maca_source_path = os.path.join(src_dir, "kernel.maca")
+            # Copy .maca to .cu so that PyTorch recognizes it as CUDA source
+            temp_dir = tempfile.mkdtemp(prefix="metax_build_")
+            cu_source_path = os.path.join(temp_dir, "kernel.cu")
+            shutil.copy2(maca_source_path, cu_source_path)
+            sources = [cu_source_path]
+            # Use a unique module name with timestamp to avoid lock file issues
+            module_name = f"nf4_dequant_{platform}_{int(time.time())}"
+            print(f"Compiling Metax CUDA kernel (this may take 1-5 minutes on first run)...")
+            _cuda_modules[platform] = load(
+                name=module_name,
+                sources=sources,
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O2"],
+                verbose=True  # Enable verbose to see compilation progress
+            )
+    else:
+        print(f"[DEBUG] Using cached CUDA module for platform={platform}")
     
     return _cuda_modules[platform]
 
 def generate_test_data(args):
     """Generate test quantized weights using bitsandbytes"""
+    # Lazy import bitsandbytes only when generating test data
+    _ensure_bitsandbytes()
     print(f"Generating test data: {args.rows}x{args.cols}, blocksize={args.blocksize}")
     torch.manual_seed(42)
     weights = torch.randn(args.rows, args.cols, dtype=torch.float32).cuda()
@@ -100,8 +116,8 @@ def generate_test_data(args):
     with open(args.config_path, "w") as f:
         f.writelines([
             f"blocksize = {args.blocksize}\n",
-            f'compute_type = "{args.compute_type}\n',
-            f'target_gpu = "{args.target_gpu}\n'
+            f'compute_type = "{args.compute_type}"\n',
+            f'target_gpu = "{args.target_gpu}"\n'
         ])
     
     reference_tensor = dequantize_nf4(quantized, quant_state)
@@ -154,52 +170,103 @@ def validate_results(args, threshold=1e-2):
     else:
         print(f"\n✗ FAILED: MAE ({mae:.6f}) >= threshold ({threshold})")
 
+def benchmark_bitsandbytes(packed_weights, absmax_q, absmax2_tensor, code2_tensor, 
+                           num_blocks, num_groups, blocksize, total_elements, 
+                           compute_type, offset, test_time=10):
+    """Benchmark bitsandbytes official dequantize kernel"""
+    _ensure_bitsandbytes()
+    
+    # Decompress absmax for bitsandbytes
+    absmax_decompressed = torch.zeros(num_blocks, dtype=torch.float32, device='cuda')
+    code2_float = code2_tensor.view(torch.bfloat16).float() if compute_type == "bf16" else code2_tensor.float()
+    for group_idx in range(num_groups):
+        start_idx, end_idx = group_idx * 256, min((group_idx + 1) * 256, num_blocks)
+        absmax_val = absmax2_tensor[group_idx].view(torch.bfloat16).float() if compute_type == "bf16" else absmax2_tensor[group_idx].float()
+        for i in range(start_idx, end_idx):
+            if i < num_blocks:
+                absmax_decompressed[i] = code2_float[int(absmax_q[i])] * absmax_val + offset
+    
+    # Benchmark bitsandbytes kernel
+    output_dtype = torch.float16 if compute_type == "fp16" else torch.bfloat16
+    A = packed_weights.view(torch.uint8).contiguous()
+    absmax_f32 = absmax_decompressed.float().contiguous()
+    # Warmup
+    for _ in range(5):
+        torch.ops.bitsandbytes.dequantize_4bit.default(
+            A, absmax_f32, blocksize, "nf4", (total_elements,), output_dtype
+        )
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(test_time):
+        torch.ops.bitsandbytes.dequantize_4bit.default(
+            A, absmax_f32, blocksize, "nf4", (total_elements,), output_dtype
+        )
+    end.record()
+    torch.cuda.synchronize()
+    
+    return start.elapsed_time(end) / test_time
+
 def dequantize_and_save(args):
     """Dequantize using CUDA kernel and save results"""
     print(f"Dequantizing using CUDA kernel (platform={args.platform})...")
+    print(f"[DEBUG] Opening weights file: {args.weights_path}")
     with open(args.weights_path, "rb") as f:
         num_rows = struct.unpack('<q', f.read(8))[0]
         num_cols = struct.unpack('<q', f.read(8))[0]
         blocksize = struct.unpack('<i', f.read(4))[0]
-        
         total_elements = num_rows * num_cols
         packed_size = (total_elements + 1) // 2
         num_blocks = (total_elements + blocksize - 1) // blocksize
         num_groups = (num_blocks + 255) // 256
+        print(f"[DEBUG] num_rows={num_rows}, num_cols={num_cols}, blocksize={blocksize}")
+        print(f"[DEBUG] total_elements={total_elements}, packed_size={packed_size}, num_blocks={num_blocks}, num_groups={num_groups}")
 
+        print(f"[DEBUG] Reading packed_weights ({packed_size} bytes)...")
         packed_weights = np.frombuffer(f.read(packed_size), dtype=np.uint8).copy()
+        print(f"[DEBUG] Reading absmax_q ({num_blocks} bytes)...")
         absmax_q = np.frombuffer(f.read(num_blocks), dtype=np.uint8).copy()
         if args.compute_type == "bf16":
+            print(f"[DEBUG] Reading absmax2 and code2 (bf16 mode)...")
             absmax2 = np.frombuffer(f.read(num_groups * 2), dtype=np.int16).copy()
             code2 = np.frombuffer(f.read(256 * 2), dtype=np.int16).copy()
+            print(f"[DEBUG] Moving tensors to CUDA (bf16)...")
+            absmax2_tensor = torch.from_numpy(absmax2).cuda().view(torch.bfloat16)
+            code2_tensor = torch.from_numpy(code2).cuda().view(torch.bfloat16)
         else:
+            print(f"[DEBUG] Reading absmax2 and code2 (fp16 mode)...")
             absmax2 = np.frombuffer(f.read(num_groups * 2), dtype=np.float16).copy()
             code2 = np.frombuffer(f.read(256 * 2), dtype=np.float16).copy()
+            print(f"[DEBUG] Moving tensors to CUDA (fp16)...")
+            absmax2_tensor = torch.from_numpy(absmax2).cuda()
+            code2_tensor = torch.from_numpy(code2).cuda()
         offset = struct.unpack('<f', f.read(4))[0]
+        print(f"[DEBUG] offset={offset}")
     
+    print(f"[DEBUG] Moving packed_weights to CUDA...")
     packed_weights_tensor = torch.from_numpy(packed_weights).cuda()
+    print(f"[DEBUG] Moving absmax_q to CUDA...")
     absmax_q_tensor = torch.from_numpy(absmax_q).cuda()
     log2_blocksize = int(math.log2(blocksize))
-    if args.compute_type == "bf16":
-        absmax2_tensor = torch.from_numpy(absmax2).cuda().view(torch.bfloat16)
-        code2_tensor = torch.from_numpy(code2).cuda().view(torch.bfloat16)
-    else:
-        absmax2_tensor = torch.from_numpy(absmax2).cuda()
-        code2_tensor = torch.from_numpy(code2).cuda()
+    print(f"[DEBUG] log2_blocksize={log2_blocksize}")
     
+    print(f"[DEBUG] Getting CUDA module for platform={args.platform}...")
     cuda_module = get_cuda_module(platform=args.platform)
-    if args.compute_type == "bf16":
-        dequant_func = cuda_module.nf4_dequant_bf16
-    else:
-        dequant_func = cuda_module.nf4_dequant_fp16
-
+    print(f"[DEBUG] Getting dequant function: {args.launcher_name}_{args.compute_type}")
+    dequant_func = getattr(cuda_module, f"{args.launcher_name}_{args.compute_type}")
     print("Warming up CUDA kernel...")
+    print("[DEBUG] Warming up CUDA kernel...")
     for _ in range(5):
         output_tensor = dequant_func(
             packed_weights_tensor, absmax_q_tensor, absmax2_tensor, code2_tensor,
             total_elements, log2_blocksize, offset
         )
+    print("[DEBUG] Calling torch.cuda.synchronize() after warmup...")
     torch.cuda.synchronize()
+    print("[DEBUG] Warmup completed!")
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -212,17 +279,40 @@ def dequantize_and_save(args):
     torch.cuda.synchronize()
     elapsed_ms = start.elapsed_time(end)
     avg_ms_per_iter = elapsed_ms / args.test_time
-    print(f"Average execution time: {avg_ms_per_iter:.3f} ms")
-    print(f"Throughput: {total_elements / (avg_ms_per_iter * 1e6):.3f} G elements/s")
 
-    if args.compute_type == "bf16":
-        output = output_tensor.cpu().to(torch.bfloat16).view(torch.int16).numpy()
-    else:
-        output = output_tensor.cpu().to(torch.float16).numpy()
+    # Calculate memory bandwidth
+    input_bytes = packed_size + num_blocks + num_groups * 2 + 256 * 2 + 4
+    output_bytes = total_elements * 2
+    total_bytes = input_bytes + output_bytes
+    effective_bandwidth = total_bytes / (avg_ms_per_iter * 1e6)
+    
+    # Benchmark bitsandbytes if requested
+    bnb_time = benchmark_bitsandbytes(
+        packed_weights_tensor, absmax_q_tensor, absmax2_tensor, code2_tensor,
+        num_blocks, num_groups, blocksize, total_elements, 
+        args.compute_type, offset, args.test_time
+    ) if args.compare_bnb else None
+    
+    # Print performance results
+    print("\n" + "="*60)
+    print("Performance Results")
+    print("="*60)
+    print(f"Custom kernel time:         {avg_ms_per_iter:.3f} ms")
+    print(f"Effective memory bandwidth: {effective_bandwidth:.2f} GB/s")
+    print(f"Throughput:                 {total_elements / (avg_ms_per_iter * 1e6):.3f} G elements/s")
+    
+    if bnb_time:
+        speedup = bnb_time / avg_ms_per_iter
+        print(f"bitsandbytes time:          {bnb_time:.3f} ms")
+        print(f"Speedup vs bitsandbytes:    {speedup:.2f}x")
+    print("="*60)
+
+    output = output_tensor.cpu().to(torch.bfloat16).view(torch.int16).numpy() if args.compute_type == "bf16" \
+        else output_tensor.cpu().to(torch.float16).numpy()
     with open(args.kernel_output_path, "wb") as f:
         f.write(output.tobytes())
     
-    print(f"Output saved to {args.kernel_output_path}")
+    print(f"\nOutput saved to {args.kernel_output_path}")
     print(f"Output shape: ({num_rows}, {num_cols})")
     print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
 
@@ -231,7 +321,7 @@ def main():
     parser.add_argument("--generate", action="store_true", help="Generate test data")
     parser.add_argument("--dequantize", action="store_true", help="Dequantize using bitsandbytes")
     parser.add_argument("--validate", action="store_true", help="Validate results")
-    parser.add_argument("--test_time", type=int, default=1)
+    parser.add_argument("--test_time", type=int, default=2)
     parser.add_argument("--rows", type=int, default=1024, help="Number of rows (default: 1024)")
     parser.add_argument("--cols", type=int, default=1024, help="Number of columns (default: 1024)")
     parser.add_argument("--blocksize", type=int, default=64, help="Block size (default: 64)")
@@ -242,6 +332,8 @@ def main():
     parser.add_argument("--compute_type", type=str, default="fp16")
     parser.add_argument("--target_gpu", type=str, default="A100")
     parser.add_argument("--platform", type=str, default="nvidia")
+    parser.add_argument("--launcher_name", type=str, default="launcher_naive")
+    parser.add_argument("--compare_bnb", action="store_true", help="Compare with bitsandbytes official kernel")
 
     args = parser.parse_args()
     
